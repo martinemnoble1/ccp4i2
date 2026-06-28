@@ -562,28 +562,49 @@ export const installIpcHandlers = (
       });
     });
 
-    // Handle completion
+    // Handle completion.
+    //
+    // Pip's exit code is NOT treated as the authority on success. Hand-rolled
+    // CCP4 python environments can carry distributions with corrupt *.dist-info
+    // metadata (e.g. meson/scons with a missing `Version:` field); modern pip
+    // iterates all installed dists to print its post-install summary and
+    // crashes with BadMetadata AFTER the requested package is already fully
+    // installed — exiting non-zero on a successful install. The real authority
+    // is the probe: can we import and build ccp4i2.config.asgi (and, packaged,
+    // meet the version floor)? So on ANY exit we run the probe and let its
+    // verdict decide. Pip's own output is surfaced as the diagnostic only if
+    // the probe also says the backend isn't usable.
     pipProcess.on("close", (code) => {
-      if (code === 0) {
-        event.sender.send("message-from-main", {
-          message: "install-requirements-progress",
-          status: "completed",
-          output: "All requirements installed successfully",
-        });
-        // Re-run the real probe rather than asserting readiness: this confirms
-        // the just-installed backend actually imports, captures its version for
-        // the UI, and re-applies the packaged version-floor gate (a pip that
-        // resolved to something below the floor still reads as not-ready).
-        runRequirementsProbe((payload) =>
-          event.sender.send("message-from-main", payload)
-        );
-      } else {
-        event.sender.send("message-from-main", {
-          message: "install-requirements-progress",
-          status: "failed",
-          output: `Installation failed with code ${code}`,
-        });
-      }
+      runRequirementsProbe((payload) => {
+        const probeSucceeded = payload.message === "requirements-exist";
+        if (probeSucceeded) {
+          // Backend imports — install effectively succeeded, even if pip exited
+          // non-zero on a broken-metadata summary crash.
+          event.sender.send("message-from-main", {
+            message: "install-requirements-progress",
+            status: "completed",
+            output:
+              code === 0
+                ? "ccp4i2 installed successfully"
+                : `ccp4i2 installed successfully (pip exited ${code}, likely ` +
+                  `a benign metadata-summary error in the CCP4 environment; ` +
+                  `the backend imports correctly).`,
+          });
+        } else {
+          // Backend still not usable — a genuine failure. Prefer pip's exit
+          // code context, fall back to the probe's diagnostic.
+          event.sender.send("message-from-main", {
+            message: "install-requirements-progress",
+            status: "failed",
+            output:
+              `Installation did not produce a usable ccp4i2 backend ` +
+              `(pip exit ${code}). ${payload.error || ""}`.trim(),
+          });
+        }
+        // Forward the probe verdict itself so the config page updates its
+        // requirements/version state (requirements-exist | requirements-missing).
+        event.sender.send("message-from-main", payload);
+      });
     });
 
     // Handle errors
